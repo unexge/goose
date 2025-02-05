@@ -1,5 +1,6 @@
 /// A truncate agent that truncates the conversation history when it exceeds the model's context limit
-/// It makes no attempt to handle context limits, and cannot read resources
+use std::time::Duration;
+
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use tokio::sync::Mutex;
@@ -8,6 +9,7 @@ use tracing::{debug, error, instrument, warn};
 use super::Agent;
 use crate::agents::capabilities::Capabilities;
 use crate::agents::extension::{ExtensionConfig, ExtensionResult};
+use crate::config::Config;
 use crate::message::{Message, ToolRequest};
 use crate::providers::base::Provider;
 use crate::providers::base::ProviderUsage;
@@ -20,20 +22,30 @@ use mcp_core::tool::Tool;
 use serde_json::{json, Value};
 
 const MAX_TRUNCATION_ATTEMPTS: usize = 3;
+const MAX_RETRIES: u32 = 5;
 const ESTIMATE_FACTOR_DECAY: f32 = 0.9;
 
 /// Truncate implementation of an Agent
 pub struct TruncateAgent {
     capabilities: Mutex<Capabilities>,
     token_counter: TokenCounter,
+    // If this is set, `ProviderError::RateLimitExceeded` errors will be retried
+    // with an exponential backoff using this number as multiplier up to `MAX_RETRIES` times.
+    retry_multiplier: Option<u64>,
 }
 
 impl TruncateAgent {
     pub fn new(provider: Box<dyn Provider>) -> Self {
+        let config = Config::global();
+        let retry_multiplier = config
+            .get::<u64>("GOOSE_AGENT_RETRY_MULTIPLIER_SECONDS")
+            .ok();
+
         let token_counter = TokenCounter::new(provider.get_model_config().tokenizer_name());
         Self {
             capabilities: Mutex::new(Capabilities::new(provider)),
             token_counter,
+            retry_multiplier,
         }
     }
 
@@ -131,6 +143,7 @@ impl Agent for TruncateAgent {
         let mut capabilities = self.capabilities.lock().await;
         let mut tools = capabilities.get_prefixed_tools().await?;
         let mut truncation_attempt: usize = 0;
+        let mut retry_count: u32 = 0;
 
         // we add in the read_resource tool by default
         // TODO: make sure there is no collision with another extension's tool name
@@ -200,8 +213,9 @@ impl Agent for TruncateAgent {
                     Ok((response, usage)) => {
                         capabilities.record_usage(usage).await;
 
-                        // Reset truncation attempt
+                        // Reset truncation and retry attempts
                         truncation_attempt = 0;
+                        retry_count = 0;
 
                         // Yield the assistant's response
                         yield response.clone();
@@ -267,6 +281,35 @@ impl Agent for TruncateAgent {
                             break;
                         }
 
+                        // Re-acquire the lock
+                        capabilities = self.capabilities.lock().await;
+
+                        // Retry the loop after truncation
+                        continue;
+                    },
+                    Err(ProviderError::RateLimitExceeded(err)) => {
+                        let Some(multiplier_secs) = self.retry_multiplier else {
+                            yield Message::assistant().with_text(
+                                format!("Ran into rate limit error: {err}.\n\n\
+                                    Please retry if you think this is a transient error.\
+                                    If you want agent to retry on rate limit errors, consider setting `GOOSE_AGENT_RETRY_MULTIPLIER_SECONDS` to enable retries."));
+                            break;
+                        };
+
+                        if retry_count >= MAX_RETRIES {
+                            yield Message::assistant().with_text(format!("Error: Rate limit exceeded even after {MAX_RETRIES} retires with an exponential-backoff. Please try to increase API limits or try again later."));
+                            break;
+                        }
+
+                        retry_count += 1;
+                        let delay = Duration::from_millis((2_u64.pow(retry_count)) * multiplier_secs);
+                        warn!("Rate limit exceeded: {err}. Retrying after {delay:?}, retry count: {retry_count}/{MAX_RETRIES}.");
+
+                        // release the lock before truncation to prevent deadlock
+                        drop(capabilities);
+
+                        // backoff
+                        tokio::time::sleep(delay).await;
 
                         // Re-acquire the lock
                         capabilities = self.capabilities.lock().await;
