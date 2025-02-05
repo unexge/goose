@@ -37,9 +37,7 @@ pub struct TruncateAgent {
 impl TruncateAgent {
     pub fn new(provider: Box<dyn Provider>) -> Self {
         let config = Config::global();
-        let retry_multiplier = config
-            .get::<u64>("GOOSE_AGENT_RETRY_MULTIPLIER_SECONDS")
-            .ok();
+        let retry_multiplier = config.get::<u64>("GOOSE_AGENT_RETRY_MULTIPLIER_MS").ok();
 
         let token_counter = TokenCounter::new(provider.get_model_config().tokenizer_name());
         Self {
@@ -288,11 +286,11 @@ impl Agent for TruncateAgent {
                         continue;
                     },
                     Err(ProviderError::RateLimitExceeded(err)) => {
-                        let Some(multiplier_secs) = self.retry_multiplier else {
+                        let Some(multiplier_ms) = self.retry_multiplier else {
                             yield Message::assistant().with_text(
                                 format!("Ran into rate limit error: {err}.\n\n\
                                     Please retry if you think this is a transient error.\
-                                    If you want agent to retry on rate limit errors, consider setting `GOOSE_AGENT_RETRY_MULTIPLIER_SECONDS` to enable retries."));
+                                    If you want agent to retry on rate limit errors, consider setting `GOOSE_AGENT_RETRY_MULTIPLIER_MS` to enable retries."));
                             break;
                         };
 
@@ -302,7 +300,7 @@ impl Agent for TruncateAgent {
                         }
 
                         retry_count += 1;
-                        let delay = Duration::from_millis((2_u64.pow(retry_count)) * multiplier_secs);
+                        let delay = Duration::from_millis((2_u64.pow(retry_count)) * multiplier_ms);
                         warn!("Rate limit exceeded: {err}. Retrying after {delay:?}, retry count: {retry_count}/{MAX_RETRIES}.");
 
                         // release the lock before truncation to prevent deadlock
