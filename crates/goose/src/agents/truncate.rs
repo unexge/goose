@@ -22,8 +22,14 @@ use mcp_core::tool::Tool;
 use serde_json::{json, Value};
 
 const MAX_TRUNCATION_ATTEMPTS: usize = 3;
-const MAX_RETRIES: u32 = 5;
 const ESTIMATE_FACTOR_DECAY: f32 = 0.9;
+
+// Multiplier to use in exponential backoff for retries on rate limit errors.
+// Backoff duration will be calculated via `2**RETRY_COUNT * GOOSE_AGENT_RETRY_MULTIPLIER_MS`.
+// So, for example if you set `GOOSE_AGENT_RETRY_MULTIPLIER_MS` to `1000` (1s),
+// requests will be retried after `2000` (2s), `4000` (4s), `8000` (8s), ... up to `MAX_RETRIES` times.
+const GOOSE_AGENT_RETRY_MULTIPLIER_MS: &str = "GOOSE_AGENT_RETRY_MULTIPLIER_MS";
+const MAX_RETRIES: u32 = 5;
 
 /// Truncate implementation of an Agent
 pub struct TruncateAgent {
@@ -37,7 +43,7 @@ pub struct TruncateAgent {
 impl TruncateAgent {
     pub fn new(provider: Box<dyn Provider>) -> Self {
         let config = Config::global();
-        let retry_multiplier = config.get::<u64>("GOOSE_AGENT_RETRY_MULTIPLIER_MS").ok();
+        let retry_multiplier = config.get::<u64>(GOOSE_AGENT_RETRY_MULTIPLIER_MS).ok();
 
         let token_counter = TokenCounter::new(provider.get_model_config().tokenizer_name());
         Self {
@@ -290,7 +296,7 @@ impl Agent for TruncateAgent {
                             yield Message::assistant().with_text(
                                 format!("Ran into rate limit error: {err}.\n\n\
                                     Please retry if you think this is a transient error.\
-                                    If you want agent to retry on rate limit errors, consider setting `GOOSE_AGENT_RETRY_MULTIPLIER_MS` to enable retries."));
+                                    If you want agent to retry on rate limit errors, consider setting `{GOOSE_AGENT_RETRY_MULTIPLIER_MS}` to enable retries."));
                             break;
                         };
 
